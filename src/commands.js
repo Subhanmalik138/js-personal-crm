@@ -151,6 +151,77 @@ function search({ db, args }) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Interactions & reminders
+// ---------------------------------------------------------------------------
+
+function log({ db, args, flags }) {
+  const contact = findContact(db, args[0]);
+  const interaction = models.createInteraction({
+    contactId: contact.id,
+    type: flags.type,
+    date: flags.date,
+    summary: flags.summary,
+  });
+  db.interactions.push(interaction);
+  return {
+    changed: true,
+    output: `logged [${interaction.type}] on ${interaction.date} for ${contact.name}\n`,
+  };
+}
+
+function remind({ db, args, flags }) {
+  const contact = findContact(db, args[0]);
+  const reminder = models.createReminder({
+    contactId: contact.id,
+    due: flags.due,
+    note: flags.note,
+  });
+  db.reminders.push(reminder);
+  return {
+    changed: true,
+    output: `reminder ${reminder.id} for ${contact.name} due ${reminder.due}\n`,
+  };
+}
+
+function due({ db, flags }) {
+  const today = models.today();
+  const open = db.reminders.filter((r) => !r.done);
+  const overdue = open.filter((r) => models.isOverdue(r, today));
+  const upcoming = open.filter((r) => !models.isOverdue(r, today));
+  const sortByDue = (a, b) => a.due.localeCompare(b.due);
+  overdue.sort(sortByDue);
+  upcoming.sort(sortByDue);
+  const nameOf = (id) => {
+    const c = db.contacts.find((x) => x.id === id);
+    return c ? c.name : '(deleted contact)';
+  };
+  const lines = [];
+  lines.push(`Overdue (${overdue.length}):`);
+  for (const r of overdue) lines.push(`  ${r.due}  ${nameOf(r.contactId)} — ${r.note}  (${r.id})`);
+  if (overdue.length === 0) lines.push('  (none)');
+  lines.push('', `Upcoming (${upcoming.length}):`);
+  for (const r of upcoming) lines.push(`  ${r.due}  ${nameOf(r.contactId)} — ${r.note}  (${r.id})`);
+  if (upcoming.length === 0) lines.push('  (none)');
+  if (flags.all) {
+    const done = db.reminders.filter((r) => r.done).sort(sortByDue);
+    lines.push('', `Done (${done.length}):`);
+    for (const r of done) lines.push(`  ${r.due}  ${nameOf(r.contactId)} — ${r.note}  (${r.id})`);
+    if (done.length === 0) lines.push('  (none)');
+  }
+  return { output: lines.join('\n') + '\n' };
+}
+
+function done({ db, args }) {
+  const id = args[0];
+  if (!id) throw new Error('done needs a reminder id');
+  const reminder = db.reminders.find((r) => r.id === id);
+  if (!reminder) throw new Error(`no reminder found for: ${id}`);
+  if (reminder.done) return { output: `reminder ${id} was already done\n` };
+  reminder.done = true;
+  return { changed: true, output: `reminder ${id} marked done\n` };
+}
+
 module.exports = {
   findContact,
   pad,
@@ -161,4 +232,8 @@ module.exports = {
   edit,
   delete: remove,
   search,
+  log,
+  remind,
+  due,
+  done,
 };
