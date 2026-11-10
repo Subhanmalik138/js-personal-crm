@@ -8,7 +8,9 @@
  * (contact lookup, table rendering) used by every later command.
  */
 
+const fs = require('node:fs');
 const models = require('./models');
+const csv = require('./csv');
 
 function findContact(db, idOrName) {
   const needle = String(idOrName || '').trim().toLowerCase();
@@ -222,6 +224,134 @@ function done({ db, args }) {
   return { changed: true, output: `reminder ${id} marked done\n` };
 }
 
+// ---------------------------------------------------------------------------
+// Tags, import/export & reports
+// ---------------------------------------------------------------------------
+
+function tag({ db, args }) {
+  const contact = findContact(db, args[0]);
+  const tags = models.normalizeTags(args.slice(1));
+  if (tags.length === 0) throw new Error('tag needs at least one tag');
+  const before = contact.tags.length;
+  contact.tags = models.normalizeTags([...contact.tags, ...tags]);
+  contact.updatedAt = new Date().toISOString();
+  const added = contact.tags.length - before;
+  return { changed: true, output: `added ${added} tag(s) to ${contact.name}: ${contact.tags.join(', ')}\n` };
+}
+
+function untag({ db, args }) {
+  const contact = findContact(db, args[0]);
+  const tags = new Set(models.normalizeTags(args.slice(1)));
+  if (tags.size === 0) throw new Error('untag needs at least one tag');
+  const before = contact.tags.length;
+  contact.tags = contact.tags.filter((t) => !tags.has(t));
+  contact.updatedAt = new Date().toISOString();
+  return { changed: true, output: `removed ${before - contact.tags.length} tag(s) from ${contact.name}\n` };
+}
+
+const EXPORT_HEADER = ['name', 'email', 'phone', 'company', 'role', 'notes', 'tags'];
+
+function exportCsv({ db, flags }) {
+  const rows = [EXPORT_HEADER];
+  const sorted = [...db.contacts].sort((a, b) => a.name.localeCompare(b.name));
+  for (const c of sorted) {
+    rows.push([c.name, c.email, c.phone, c.company, c.role, c.notes, c.tags.join(';')]);
+  }
+  const text = csv.toCsv(rows);
+  if (flags.file) {
+    fs.writeFileSync(flags.file, text, 'utf8');
+    return { output: `exported ${sorted.length} contact(s) to ${flags.file}\n` };
+  }
+  return { output: text };
+}
+
+function importCsv({ db, args }) {
+  const file = args[0];
+  if (!file) throw new Error('import needs a CSV file path');
+  const text = fs.readFileSync(file, 'utf8');
+  const rows = csv.parseCsv(text);
+  if (rows.length === 0) throw new Error('CSV file is empty');
+  const header = rows[0].map((h) => h.trim().toLowerCase());
+  const idx = (name) => header.indexOf(name);
+  if (idx('name') === -1) throw new Error('CSV must have a "name" column');
+  let added = 0;
+  let skipped = 0;
+  for (const row of rows.slice(1)) {
+    const get = (name) => (idx(name) === -1 ? '' : row[idx(name)] || '');
+    const name = get('name').trim();
+    if (!name) {
+      skipped += 1;
+      continue;
+    }
+    const email = get('email').trim();
+    if (email && db.contacts.some((c) => c.email && c.email.toLowerCase() === email.toLowerCase())) {
+      skipped += 1; // duplicate email — keep the existing contact
+      continue;
+    }
+    db.contacts.push(
+      models.createContact({
+        name,
+        email,
+        phone: get('phone'),
+        company: get('company'),
+        role: get('role'),
+        notes: get('notes'),
+        tags: get('tags') ? get('tags').split(';') : [],
+      }),
+    );
+    added += 1;
+  }
+  return { changed: true, output: `imported ${added} contact(s), skipped ${skipped}\n` };
+}
+
+function stats({ db }) {
+  const today = models.today();
+  const byCompany = new Map();
+  for (const c of db.contacts) {
+    const key = c.company || '(no company)';
+    byCompany.set(key, (byCompany.get(key) || 0) + 1);
+  }
+  const interactionsByContact = new Map();
+  for (const i of db.interactions) {
+    interactionsByContact.set(i.contactId, (interactionsByContact.get(i.contactId) || 0) + 1);
+  }
+  const mostActive = [...interactionsByContact.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5)
+    .map(([id, count]) => {
+      const c = db.contacts.find((x) => x.id === id);
+      return `  ${c ? c.name : '(deleted)'}: ${count}`;
+    });
+  const overdue = db.reminders.filter((r) => models.isOverdue(r, today)).length;
+  const openReminders = db.reminders.filter((r) => !r.done).length;
+  const tagCounts = new Map();
+  for (const c of db.contacts) {
+    for (const t of c.tags) tagCounts.set(t, (tagCounts.get(t) || 0) + 1);
+  }
+  const topTags = [...tagCounts.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5)
+    .map(([t, n]) => `  ${t}: ${n}`);
+
+  const lines = [
+    `Contacts:            ${db.contacts.length}`,
+    `Interactions:        ${db.interactions.length}`,
+    `Reminders open:      ${openReminders} (${overdue} overdue)`,
+    '',
+    'By company:',
+    ...[...byCompany.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .map(([company, n]) => `  ${company}: ${n}`),
+    '',
+    'Most active contacts:',
+    ...(mostActive.length ? mostActive : ['  (no interactions yet)']),
+    '',
+    'Top tags:',
+    ...(topTags.length ? topTags : ['  (no tags yet)']),
+  ];
+  return { output: lines.join('\n') + '\n' };
+}
+
 module.exports = {
   findContact,
   pad,
@@ -236,4 +366,9 @@ module.exports = {
   remind,
   due,
   done,
+  tag,
+  untag,
+  export: exportCsv,
+  import: importCsv,
+  stats,
 };
